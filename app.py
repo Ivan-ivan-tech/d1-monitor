@@ -14,67 +14,32 @@ ALLOWED_IDS = [id.strip() for id in ALLOWED_IDS_RAW.split(',')]
 
 TIMEOUT_SEC = 600  # 10 минут
 
-# Хранилище устройств
+# Хранилище: для каждого устройства запоминаем время последнего пинга и отправляли ли тревогу
 devices = {}
 
-# Блокировка для потокобезопасности
-from threading import Lock
-devices_lock = Lock()
-
 def send_telegram_alert(device_id):
-    """Отправляет сообщение о пропаже интернета (ТОЛЬКО ОДИН РАЗ)"""
-    with devices_lock:
-        if device_id not in devices:
-            print(f"[ALERT] Device {device_id} not found")
-            return
-        
-        # ЕСЛИ УЖЕ ОТПРАВЛЕНО — ВЫХОДИМ
-        if devices[device_id].get('alert_sent', False):
-            print(f"[ALERT] Alert already sent for {device_id}, skipping")
-            return
-        
-        print(f"[ALERT] Sending alert for {device_id}")
-        # Помечаем, что отправляем
-        devices[device_id]['alert_sent'] = True
+    """Отправляет сообщение ТОЛЬКО ОДИН РАЗ за пропадание"""
+    # Если устройства нет в словаре — выходим
+    if device_id not in devices:
+        return
     
+    # Если уже отправляли — выходим
+    if devices[device_id].get('alert_sent', False):
+        print(f"[ALERT] Уже отправлено для {device_id}, пропускаем")
+        return
+    
+    # Отправляем
     if TOKEN and CHAT_ID:
         try:
             url = f'https://api.telegram.org/bot{TOKEN}/sendMessage'
             message = f'❌ ПРОПАЛ ИНТЕРНЕТ: {device_id} (нет пингов более {TIMEOUT_SEC // 60} минут)'
-            response = requests.post(url, json={
-                'chat_id': CHAT_ID,
-                'text': message
-            }, timeout=5)
-            print(f"[ALERT] Response: {response.status_code}")
+            requests.post(url, json={'chat_id': CHAT_ID, 'text': message}, timeout=5)
+            print(f"[ALERT] Отправлено для {device_id}")
+            
+            # ПОСЛЕ УСПЕШНОЙ ОТПРАВКИ — СТАВИМ ФЛАГ
+            devices[device_id]['alert_sent'] = True
         except Exception as e:
-            print(f"[ALERT] Error sending: {e}")
-            # Если отправка не удалась, сбрасываем флаг
-            with devices_lock:
-                if device_id in devices:
-                    devices[device_id]['alert_sent'] = False
-
-def check_device_timeout(device_id):
-    """Функция для таймера — проверяет, нужно ли отправить alert"""
-    with devices_lock:
-        if device_id not in devices:
-            return
-        
-        last_seen = devices[device_id].get('last_seen', 0)
-        alert_sent = devices[device_id].get('alert_sent', False)
-        now = time.time()
-        
-        print(f"[TIMER] Device {device_id}: last_seen={last_seen}, now={now}, diff={now - last_seen}, alert_sent={alert_sent}")
-        
-        # Если прошло больше TIMEOUT_SEC и alert ещё не отправлен
-        if not alert_sent and (now - last_seen) > TIMEOUT_SEC:
-            # Отправляем alert (снимаем блокировку внутри функции)
-            send_telegram_alert(device_id)
-
-def start_timer(device_id):
-    """Запускает таймер для устройства"""
-    timer = threading.Timer(TIMEOUT_SEC, check_device_timeout, args=[device_id])
-    timer.daemon = True
-    return timer
+            print(f"[ALERT] Ошибка: {e}")
 
 @app.route('/')
 def home():
@@ -82,68 +47,57 @@ def home():
 
 @app.route('/ping')
 def ping():
-    """Принимает пинги от устройств"""
     device_id = request.args.get('id', 'unknown')
     
-    print(f"[PING] Received from {device_id}")
-    
-    # Проверка разрешенных устройств
     if device_id not in ALLOWED_IDS:
-        print(f"[PING] Forbidden: {device_id}")
-        return f"Forbidden: {device_id} not allowed", 403
+        return f"Forbidden: {device_id}", 403
     
     now = time.time()
     
-    with devices_lock:
-        # Создаем или обновляем запись
-        if device_id not in devices:
-            devices[device_id] = {
-                'last_seen': now,
-                'alert_sent': False,
-                'timer': None
-            }
-            print(f"[PING] New device: {device_id}")
-        else:
-            devices[device_id]['last_seen'] = now
-            devices[device_id]['alert_sent'] = False  # СБРАСЫВАЕМ ФЛАГ ПРИ ПИНГЕ
-            print(f"[PING] Reset alert_sent for {device_id}")
-        
-        # Останавливаем старый таймер
-        old_timer = devices[device_id]['timer']
-        if old_timer and old_timer.is_alive():
-            old_timer.cancel()
-            print(f"[PING] Cancelled old timer for {device_id}")
-        
-        # Запускаем новый таймер
-        devices[device_id]['timer'] = start_timer(device_id)
-        devices[device_id]['timer'].start()
-        print(f"[PING] Started new timer for {device_id}")
+    # Создаём запись, если её нет
+    if device_id not in devices:
+        devices[device_id] = {
+            'last_seen': now,
+            'alert_sent': False,
+            'timer': None
+        }
+    
+    # Обновляем время последнего пинга
+    devices[device_id]['last_seen'] = now
+    
+    # Если был флаг тревоги — сбрасываем (интернет вернулся)
+    if devices[device_id].get('alert_sent', False):
+        print(f"[PING] {device_id} вернулся, сбрасываем alert_sent")
+        devices[device_id]['alert_sent'] = False
+    
+    # Останавливаем старый таймер, если есть
+    old_timer = devices[device_id].get('timer')
+    if old_timer and old_timer.is_alive():
+        old_timer.cancel()
+        print(f"[PING] Остановлен старый таймер для {device_id}")
+    
+    # Запускаем новый таймер
+    timer = threading.Timer(TIMEOUT_SEC, send_telegram_alert, args=[device_id])
+    timer.daemon = True
+    devices[device_id]['timer'] = timer
+    timer.start()
+    
+    print(f"[PING] {device_id} обновлён, новый таймер на {TIMEOUT_SEC} сек")
     
     return f"OK: {device_id}"
 
 @app.route('/status')
 def status():
-    """Возвращает статус всех устройств"""
-    with devices_lock:
-        result = {}
-        for device_id, data in devices.items():
-            last_seen_str = datetime.fromtimestamp(data['last_seen']).strftime('%Y-%m-%d %H:%M:%S')
-            result[device_id] = {
-                'last_ping': last_seen_str,
-                'alert_sent': data.get('alert_sent', False),
-                'time_since_last': int(time.time() - data['last_seen'])
-            }
-    return result
-
-@app.route('/debug')
-def debug():
-    """Отладочный эндпоинт (можно удалить позже)"""
-    with devices_lock:
-        return {
-            'devices': list(devices.keys()),
-            'allowed_ids': ALLOWED_IDS,
-            'timeout_sec': TIMEOUT_SEC
+    result = {}
+    now = time.time()
+    for device_id, data in devices.items():
+        last_seen_str = datetime.fromtimestamp(data['last_seen']).strftime('%Y-%m-%d %H:%M:%S')
+        result[device_id] = {
+            'last_ping': last_seen_str,
+            'alert_sent': data.get('alert_sent', False),
+            'seconds_ago': int(now - data['last_seen'])
         }
+    return result
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
